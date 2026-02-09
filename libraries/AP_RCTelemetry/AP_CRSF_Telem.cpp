@@ -100,6 +100,10 @@
 
 #include <AP_Vehicle/AP_Vehicle_Type.h>
 
+#if AP_CRSF_MAVLINK_ENABLED
+#include "AP_CRSF_MAVLink.h"
+#endif
+
 //#define CRSF_DEBUG
 #ifdef CRSF_DEBUG
 # define debug(fmt, args...)	hal.console->printf("CRSF: " fmt "\n", ##args)
@@ -166,6 +170,9 @@ void AP_CRSF_Telem::setup_wfq_scheduler(void)
     add_scheduler_entry(5, 20);     // command          50Hz (generally not active unless requested by the TX)
     add_scheduler_entry(5, 500);    // version ping      2Hz (only active at startup)
     add_scheduler_entry(5, 100);    // device ping      10Hz (only active during TX loss, also see CRSF_RX_TIMEOUT)
+#if AP_CRSF_MAVLINK_ENABLED
+    add_scheduler_entry(5000, 1);   // mavlink envelope  every cycle when data pending
+#endif
     disable_scheduler_entry(DEVICE_PING);
 }
 
@@ -519,6 +526,10 @@ bool AP_CRSF_Telem::is_packet_ready(uint8_t idx, bool queue_empty)
         return true; // always send heartbeat if enabled
     case DEVICE_PING:
         return !_crsf_version.pending;  // only send pings if version has been negotiated
+#if AP_CRSF_MAVLINK_ENABLED
+    case MAVLINK_ENVELOPE:
+        return _mav_uart != nullptr && (_mav_tx_current_chunk < _mav_tx_total_chunks || _mav_uart->tx_pending());
+#endif
     default:
         return _enable_telemetry;
     }
@@ -600,6 +611,11 @@ void AP_CRSF_Telem::process_packet(uint8_t idx)
         case DEVICE_PING:
             calc_device_ping(AP_CRSF_Protocol::CRSF_ADDRESS_CRSF_RECEIVER);
             break;
+#if AP_CRSF_MAVLINK_ENABLED
+        case MAVLINK_ENVELOPE:
+            calc_mavlink_envelope();
+            break;
+#endif
         default:
             break;
     }
@@ -645,6 +661,12 @@ bool AP_CRSF_Telem::_process_frame(AP_RCProtocol_CRSF::FrameType frame_type, voi
     case AP_CRSF_Protocol::CRSF_FRAMETYPE_COMMAND:
         process_command_frame((CommandFrame*)data);
         break;
+
+#if AP_CRSF_MAVLINK_ENABLED
+    case AP_CRSF_Protocol::CRSF_FRAMETYPE_MAVLINK_ENVELOPE:
+        process_mavlink_envelope((const uint8_t*)data, length);
+        break;
+#endif
 
     default:
         break;
@@ -2327,6 +2349,111 @@ namespace AP {
         return AP_CRSF_Telem::get_singleton();
     }
 };
+
+#if AP_CRSF_MAVLINK_ENABLED
+
+#define CRSF_MAV_CHUNK_MAX 58
+#define CRSF_MAV_CHUNKS_MAX 5
+
+void AP_CRSF_Telem::init_mavlink()
+{
+    if (_mav_init_done) {
+        return;
+    }
+    _mav_init_done = true;
+
+    _mav_uart = NEW_NOTHROW AP_CRSF_MAVLink_UART();
+    if (_mav_uart == nullptr) {
+        return;
+    }
+
+    if (!gcs().create_virtual_mavlink_backend(*_mav_uart)) {
+        _mav_uart = nullptr;
+    }
+}
+
+void AP_CRSF_Telem::process_mavlink_envelope(const uint8_t *data, uint8_t length)
+{
+    if (!_enable_telemetry) {
+        _enable_telemetry = true;
+    }
+
+    init_mavlink();
+    if (_mav_uart == nullptr || length < 2) {
+        return;
+    }
+
+    const uint8_t chunk_info = data[0];
+    const uint8_t total = chunk_info >> 4;
+    const uint8_t current = chunk_info & 0x0F;
+    const uint8_t size = data[1];
+
+    if (total >= CRSF_MAV_CHUNKS_MAX || size > CRSF_MAV_CHUNK_MAX || length < 2 + size) {
+        return;
+    }
+
+    if (current == 0) {
+        _mav_rx_offset = 0;
+        _mav_expected_chunk = 0;
+    }
+
+    if (current != _mav_expected_chunk) {
+        _mav_rx_offset = 0;
+        _mav_expected_chunk = 0;
+        return;
+    }
+
+    if (_mav_rx_offset + size > sizeof(_mav_rx_buf)) {
+        _mav_rx_offset = 0;
+        _mav_expected_chunk = 0;
+        return;
+    }
+
+    memcpy(&_mav_rx_buf[_mav_rx_offset], &data[2], size);
+    _mav_rx_offset += size;
+
+    if (current == total) {
+        _mav_uart->push_rx(_mav_rx_buf, _mav_rx_offset);
+        _mav_rx_offset = 0;
+        _mav_expected_chunk = 0;
+    } else {
+        _mav_expected_chunk = current + 1;
+    }
+}
+
+void AP_CRSF_Telem::calc_mavlink_envelope()
+{
+    if (_mav_uart == nullptr) {
+        return;
+    }
+
+    // if no multi-chunk sequence in progress, read fresh data from TX buffer
+    if (_mav_tx_current_chunk >= _mav_tx_total_chunks) {
+        _mav_tx_size = _mav_uart->pop_tx(_mav_tx_buf, sizeof(_mav_tx_buf));
+        if (_mav_tx_size == 0) {
+            return;
+        }
+        _mav_tx_total_chunks = (_mav_tx_size + CRSF_MAV_CHUNK_MAX - 1) / CRSF_MAV_CHUNK_MAX;
+        _mav_tx_current_chunk = 0;
+    }
+
+    // calculate offset and size for current chunk
+    const uint16_t offset = _mav_tx_current_chunk * CRSF_MAV_CHUNK_MAX;
+    const uint8_t chunk_size = MIN((uint16_t)CRSF_MAV_CHUNK_MAX, _mav_tx_size - offset);
+
+    uint8_t *payload = (uint8_t *)&_telem;
+    payload[0] = ((_mav_tx_total_chunks - 1) << 4) | _mav_tx_current_chunk;
+    payload[1] = chunk_size;
+    memcpy(&payload[2], &_mav_tx_buf[offset], chunk_size);
+
+    _mav_tx_current_chunk++;
+
+    _telem_size = 2 + chunk_size;
+    _telem_type = AP_CRSF_Protocol::CRSF_FRAMETYPE_MAVLINK_ENVELOPE;
+    _telem_pending = true;
+}
+
+#endif // AP_CRSF_MAVLINK_ENABLED
 
 #endif  // HAL_CRSF_TELEM_ENABLED
 

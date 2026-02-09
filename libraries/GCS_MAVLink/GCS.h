@@ -1261,6 +1261,9 @@ public:
     // install an alternative protocol handler
     bool install_alternative_protocol(mavlink_channel_t chan, GCS_MAVLINK::protocol_handler_fn_t handler);
 
+    // create a GCS_MAVLINK backend on a virtual UART (no serial manager)
+    bool create_virtual_mavlink_backend(AP_HAL::UARTDriver &uart);
+
     // get the VFR_HUD throttle
     int16_t get_hud_throttle(void) const {
         const GCS_MAVLINK *link = chan(0);

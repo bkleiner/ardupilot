@@ -1869,15 +1869,17 @@ void GCS_MAVLINK::packetReceived(const mavlink_status_t &status,
     if (msg.msgid != MAVLINK_MSG_ID_RADIO && msg.msgid != MAVLINK_MSG_ID_RADIO_STATUS) {
         mavlink_active |= (1U<<(chan-MAVLINK_COMM_0));
     }
-    const auto mavlink_protocol = uartstate->get_protocol();
-    if (!(status.flags & MAVLINK_STATUS_FLAG_IN_MAVLINK1) &&
-        (status.flags & MAVLINK_STATUS_FLAG_OUT_MAVLINK1) &&
-        (mavlink_protocol == AP_SerialManager::SerialProtocol_MAVLink2 ||
-         mavlink_protocol == AP_SerialManager::SerialProtocol_MAVLinkHL)) {
-        // if we receive any MAVLink2 packets on a connection
-        // currently sending MAVLink1 then switch to sending
-        // MAVLink2
-        _channel_status.flags &= ~MAVLINK_STATUS_FLAG_OUT_MAVLINK1;
+    if (uartstate != nullptr) {
+        const auto mavlink_protocol = uartstate->get_protocol();
+        if (!(status.flags & MAVLINK_STATUS_FLAG_IN_MAVLINK1) &&
+            (status.flags & MAVLINK_STATUS_FLAG_OUT_MAVLINK1) &&
+            (mavlink_protocol == AP_SerialManager::SerialProtocol_MAVLink2 ||
+             mavlink_protocol == AP_SerialManager::SerialProtocol_MAVLinkHL)) {
+            // if we receive any MAVLink2 packets on a connection
+            // currently sending MAVLink1 then switch to sending
+            // MAVLink2
+            _channel_status.flags &= ~MAVLINK_STATUS_FLAG_OUT_MAVLINK1;
+        }
     }
 }
 
@@ -2843,6 +2845,31 @@ void GCS::create_gcs_mavlink_backend(AP_HAL::UARTDriver &uart)
     }
 
     _num_gcs++;
+}
+
+bool GCS::create_virtual_mavlink_backend(AP_HAL::UARTDriver &uart)
+{
+    if (_num_gcs >= ARRAY_SIZE(_chan_var_info)) {
+        return false;
+    }
+    _chan[_num_gcs] = new_gcs_mavlink_backend(uart);
+    if (_chan[_num_gcs] == nullptr) {
+        return false;
+    }
+
+    const mavlink_channel_t channel = (mavlink_channel_t)(MAVLINK_COMM_0 + _num_gcs);
+    if (!valid_channel(channel)) {
+        delete _chan[_num_gcs];
+        _chan[_num_gcs] = nullptr;
+        return false;
+    }
+
+    _chan[_num_gcs]->chan = channel;
+    mavlink_comm_port[channel] = &uart;
+
+    _chan_var_info[_num_gcs] = _chan[_num_gcs]->var_info;
+    _num_gcs++;
+    return true;
 }
 
 void GCS::setup_uarts()
@@ -7367,8 +7394,13 @@ uint64_t GCS_MAVLINK::capabilities() const
     uint64_t ret = MAV_PROTOCOL_CAPABILITY_PARAM_FLOAT |
         MAV_PROTOCOL_CAPABILITY_COMPASS_CALIBRATION;
 
-    const auto mavlink_protocol = uartstate->get_protocol();
-    if (mavlink_protocol == AP_SerialManager::SerialProtocol_MAVLink2 || mavlink_protocol == AP_SerialManager::SerialProtocol_MAVLinkHL) {
+    if (uartstate != nullptr) {
+        const auto mavlink_protocol = uartstate->get_protocol();
+        if (mavlink_protocol == AP_SerialManager::SerialProtocol_MAVLink2 || mavlink_protocol == AP_SerialManager::SerialProtocol_MAVLinkHL) {
+            ret |= MAV_PROTOCOL_CAPABILITY_MAVLINK2;
+        }
+    } else {
+        // virtual backends default to MAVLink2
         ret |= MAV_PROTOCOL_CAPABILITY_MAVLINK2;
     }
 

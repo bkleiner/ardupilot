@@ -359,6 +359,9 @@ private:
         GENERAL_COMMAND,
         VERSION_PING,
         DEVICE_PING,
+#if AP_CRSF_MAVLINK_ENABLED
+        MAVLINK_ENVELOPE,
+#endif
         NUM_SENSORS
     };
 
@@ -384,6 +387,11 @@ private:
     void calc_command_response();
     void calc_bind();
     void calc_parameter();
+#if AP_CRSF_MAVLINK_ENABLED
+    void process_mavlink_envelope(const uint8_t *data, uint8_t length);
+    void calc_mavlink_envelope();
+    void init_mavlink();
+#endif
 #if AP_CRSF_SCRIPTING_ENABLED
     bool calc_scripted_parameter();
 #endif
@@ -476,6 +484,24 @@ private:
     bool _vtx_options_change_pending;
 
     bool _noted_lq_as_rssi_active;
+
+#if AP_CRSF_MAVLINK_ENABLED
+    class AP_CRSF_MAVLink_UART *_mav_uart = nullptr;
+
+    // reassembly state for incoming MAVLink envelopes
+    uint8_t _mav_rx_buf[280];
+    uint16_t _mav_rx_offset = 0;
+    uint8_t _mav_expected_chunk = 0;
+
+    // TX chunking state for outgoing MAVLink envelopes
+    // 5 chunks * 58 bytes max per chunk = 290 bytes
+    uint8_t _mav_tx_buf[290];
+    uint16_t _mav_tx_size = 0;
+    uint8_t _mav_tx_total_chunks = 0;
+    uint8_t _mav_tx_current_chunk = 0;
+
+    bool _mav_init_done = false;
+#endif
 
     static AP_CRSF_Telem *singleton;
 };
